@@ -81,7 +81,7 @@ def main():
         for ds in __all_datasets__:
             if ds in __gated_datasets__:
                 bar = "*" * 50
-                print(f"{bar}\n[NOTE] Dataset '{ds}' is gated and requires access apply for access on Hugging Face. Please visit https://huggingface.co/m-a-p/{ds} to apply for access if you haven't done so already.\n{bar}")
+                print(f"{bar}\n[NOTE] Dataset '{ds}' is gated and requires access apply for access on Hugging Face. Please visit https://huggingface.co/datasets/m-a-p/{ds} to apply for access if you haven't done so already.\n{bar}")
             download_dataset(ds, args.save_dir)
     else:
         ds = args.dataset
