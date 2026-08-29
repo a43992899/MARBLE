@@ -43,7 +43,7 @@ model:
     sample_rate: 16000
     fps: 25
     use_ema: false
-    loss_weights: [1.0, 1.0, 0.0] # beat, downbeat, tempo (tempo disabled, seems interfering with beat tracking)
+    loss_weights: [1.0, 1.0, 0.0] # tempo metrics are derived from decoded beat intervals
 
     encoder:
       class_path: marble.encoders.Qwen2AudioInstructEncoder.model.Qwen2AudioInstructEncoder
@@ -163,6 +163,7 @@ data:
         jsonl: data/GTZAN/GTZANBeatTracking.train.jsonl
         label_freq: 25
         num_neighbors: 2
+        use_local_bpm: false # use the annotated track tempo, not clip beat-count quantization
     val:
       class_path: marble.tasks.GTZANBeatTracking.datamodule.GTZANBeatTrackingAudioVal
       init_args:
@@ -174,6 +175,7 @@ data:
         jsonl: data/GTZAN/GTZANBeatTracking.val.jsonl
         label_freq: 25
         num_neighbors: 0
+        use_local_bpm: false
     test:
       class_path: marble.tasks.GTZANBeatTracking.datamodule.GTZANBeatTrackingAudioTest
       init_args:
@@ -185,6 +187,7 @@ data:
         jsonl: data/GTZAN/GTZANBeatTracking.test.jsonl
         label_freq: 25
         num_neighbors: 0
+        use_local_bpm: false
 
 optimizer:
   class_path: torch.optim.Adam

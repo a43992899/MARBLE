@@ -10,17 +10,69 @@ from marble.core.base_task import BaseTask
 from marble.core.utils import instantiate_from_config
 
 from marble.tasks.GTZANBeatTracking.madmom.beats import DBNBeatTrackingProcessor
+from marble.tasks.GTZANBeatTracking.madmom.downbeats import DBNDownBeatTrackingProcessor
 from marble.tasks.GTZANBeatTracking.metrics import TimeEventFMeasure, TempoMAE, TempoAccuracy
 from marble.utils.utils import times_to_mask, mask_to_times
+
+
+def tempo_from_beat_times(beat_times: np.ndarray) -> float:
+    """Estimate clip tempo from decoded inter-beat intervals."""
+    beat_times = np.asarray(beat_times, dtype=np.float64)
+    if beat_times.size < 2:
+        return 0.0
+    intervals = np.diff(beat_times)
+    intervals = intervals[np.isfinite(intervals) & (intervals > 0)]
+    if intervals.size == 0:
+        return 0.0
+    return float(60.0 / np.median(intervals))
+
+
+class BeatDownbeatPostProcessor:
+    """Decode beats independently and downbeats with a joint meter-aware DBN."""
+
+    def __init__(self, fps: int, beats_per_bar=(2, 3, 4)):
+        self.beat_dbn = DBNBeatTrackingProcessor(fps=fps)
+        self.downbeat_dbn = DBNDownBeatTrackingProcessor(
+            beats_per_bar=list(beats_per_bar),
+            fps=fps,
+        )
+
+    @staticmethod
+    def _probabilities(logits: torch.Tensor) -> np.ndarray:
+        probabilities = torch.sigmoid(logits).detach().cpu().to(torch.float64).numpy()
+        epsilon = 1e-5
+        return probabilities * (1.0 - epsilon) + epsilon / 2.0
+
+    def __call__(
+        self,
+        beat_logits: torch.Tensor,
+        downbeat_logits: torch.Tensor,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        beat_prob = self._probabilities(beat_logits)
+        downbeat_prob = self._probabilities(downbeat_logits)
+        beat_times = self.beat_dbn(beat_prob)
+
+        # madmom's downbeat DBN consumes mutually exclusive beat/downbeat
+        # activations. Downbeats are a subset of the binary beat targets, so
+        # convert the two sigmoid heads as recommended by Böck et al. and used
+        # by Beat This before joint meter decoding.
+        epsilon = 1e-5
+        beat_only_prob = np.maximum(beat_prob - downbeat_prob, epsilon / 2.0)
+        joint_activations = np.stack((beat_only_prob, downbeat_prob), axis=1)
+        decoded = self.downbeat_dbn(joint_activations)
+        if len(decoded) == 0:
+            return beat_times, np.empty(0, dtype=np.float64)
+        downbeat_times = decoded[decoded[:, 1] == 1, 0]
+        return beat_times, downbeat_times
 
 
 class ProbeAudioTask(BaseTask):
     """
     GTZAN Beat/Downbeat/Tempo Probe Task with DBN‐based decoding.
 
-    - Beat tracking: frame‐wise logits → sigmoid → DBN → event times → mask → TimeEventFMeasure
-    - Downbeat tracking: same process via DBN on downbeat head
-    - Tempo estimation: scalar regression (BPM) → TempoMAE & TempoAccuracy
+    - Beat tracking: frame-wise logits -> beat DBN -> event metrics
+    - Downbeat tracking: joint beat/downbeat logits -> meter-aware DBN -> event metrics
+    - Tempo estimation: median decoded inter-beat interval -> TempoMAE & TempoAccuracy
     """
 
     def __init__(
@@ -54,9 +106,8 @@ class ProbeAudioTask(BaseTask):
             for name, cfg in metrics.get(split, {}).items():
                 metric_maps[split][name] = instantiate_from_config(cfg)
 
-        # 4) Prepare DBN processors (can be reused across batches/epochs)
-        self.beat_dbn = DBNBeatTrackingProcessor(fps=self.label_freq)
-        self.dbn_dbn = DBNBeatTrackingProcessor(fps=self.label_freq)
+        # 4) Prepare beat and joint downbeat processors.
+        self.postprocessor = BeatDownbeatPostProcessor(fps=self.label_freq)
 
         # 5) Call BaseTask.__init__ once, passing in encoder/transforms/decoders/losses.
         #    We pass metrics={} here because we will manage all updates manually.
@@ -94,17 +145,21 @@ class ProbeAudioTask(BaseTask):
         # Unpack outputs
         beat_logits = outputs["beat"]            # shape: (B, T)
         db_logits   = outputs["downbeat"]        # shape: (B, T)
-        tempo_pred  = outputs["tempo"].squeeze()  # shape: (B,)
+        tempo_pred  = outputs["tempo"].reshape(-1)  # shape: (B,)
 
         # Unpack targets
         beat_target  = targets["beat"].float()           # shape: (B, T)
         db_target    = targets["downbeat"].float()       # shape: (B, T)
-        tempo_target = targets["tempo"].float().squeeze() # shape: (B,)
+        tempo_target = targets["tempo"].float().reshape(-1) # shape: (B,)
 
         # Compute individual losses
         loss_beat  = self.loss_fns[0](beat_logits, beat_target) * self.loss_weights[0]
         loss_db    = self.loss_fns[1](db_logits, db_target) * self.loss_weights[1]
-        loss_tempo = self.loss_fns[2](tempo_pred, tempo_target) * self.loss_weights[2]
+        loss_tempo = (
+            self.loss_fns[2](tempo_pred, tempo_target) * self.loss_weights[2]
+            if self.loss_weights[2]
+            else tempo_pred.new_zeros(())
+        )
         total_loss = loss_beat + loss_db + loss_tempo
 
         # Log training losses
@@ -134,17 +189,21 @@ class ProbeAudioTask(BaseTask):
         # Unpack outputs
         beat_logits = outputs["beat"]            # (B, T)
         db_logits   = outputs["downbeat"]        # (B, T)
-        tempo_pred  = outputs["tempo"].squeeze()  # (B,)
+        tempo_pred  = outputs["tempo"].reshape(-1)  # (B,)
 
         # Unpack targets
         beat_target  = targets["beat"].float()           # (B, T)
         db_target    = targets["downbeat"].float()       # (B, T)
-        tempo_target = targets["tempo"].float().squeeze() # (B,)
+        tempo_target = targets["tempo"].float().reshape(-1) # (B,)
 
         # Compute frame‐wise losses for monitoring
         loss_beat  = self.loss_fns[0](beat_logits, beat_target) * self.loss_weights[0]
         loss_db    = self.loss_fns[1](db_logits, db_target) * self.loss_weights[1]
-        loss_tempo = self.loss_fns[2](tempo_pred, tempo_target) * self.loss_weights[2]
+        loss_tempo = (
+            self.loss_fns[2](tempo_pred, tempo_target) * self.loss_weights[2]
+            if self.loss_weights[2]
+            else tempo_pred.new_zeros(())
+        )
         total_loss = loss_beat + loss_db + loss_tempo
 
         self.log("val/loss_beat",  loss_beat,  on_step=False, on_epoch=True, prog_bar=False)
@@ -152,32 +211,35 @@ class ProbeAudioTask(BaseTask):
         self.log("val/loss_tempo", loss_tempo, on_step=False, on_epoch=True, prog_bar=False)
         self.log("val/total_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
 
-        # Convert beat/downbeat logits to probabilities
-        beat_probs = torch.sigmoid(beat_logits)  # (B, T)
-        db_probs   = torch.sigmoid(db_logits)    # (B, T)
-        B, T = beat_probs.shape
+        B, T = beat_logits.shape
+        decoded_tempi = []
 
         # For each sample in the batch, decode events and update f1 metrics
         for b in range(B):
             # --- Beat decoding ---
-            beat_act = beat_probs[b].detach().cpu().to(torch.float32).numpy()      # (T,)
-            est_beat_times = self.beat_dbn(beat_act)             # e.g. [0.5, 1.333, ...] in seconds
+            est_beat_times, est_db_times = self.postprocessor(
+                beat_logits[b], db_logits[b]
+            )
             est_beat_mask_np = times_to_mask(est_beat_times, T, self.label_freq)
             est_beat_tensor = torch.from_numpy(est_beat_mask_np).unsqueeze(0)  # (1, T)
             ref_beat_tensor = beat_target[b].unsqueeze(0)                     # (1, T)
             self.val_beat_f1.update(est_beat_tensor, ref_beat_tensor)
 
             # --- Downbeat decoding ---
-            db_act = db_probs[b].detach().cpu().to(torch.float32).numpy()
-            est_db_times = self.dbn_dbn(db_act)
             est_db_mask_np = times_to_mask(est_db_times, T, self.label_freq)
             est_db_tensor = torch.from_numpy(est_db_mask_np).unsqueeze(0)     # (1, T)
             ref_db_tensor = db_target[b].unsqueeze(0)                          # (1, T)
             self.val_db_f1.update(est_db_tensor, ref_db_tensor)
+            decoded_tempi.append(tempo_from_beat_times(est_beat_times))
 
-        # --- Tempo metrics update (B,)
-        self.val_tempo_mae.update(tempo_pred, tempo_target)
-        self.val_tempo_acc.update(tempo_pred, tempo_target)
+        # Tempo is an evaluation derived from the trained beat track. The
+        # historical third head has zero loss weight and is not a valid tempo
+        # estimator.
+        tempo_eval = torch.as_tensor(
+            decoded_tempi, device=tempo_target.device, dtype=tempo_target.dtype
+        )
+        self.val_tempo_mae.update(tempo_eval, tempo_target)
+        self.val_tempo_acc.update(tempo_eval, tempo_target)
 
 
     def on_validation_epoch_end(self,):
@@ -215,36 +277,37 @@ class ProbeAudioTask(BaseTask):
 
         beat_logits = outputs["beat"]             # (B, T)
         db_logits   = outputs["downbeat"]         # (B, T)
-        tempo_pred  = outputs["tempo"].squeeze()   # (B,)
+        tempo_pred  = outputs["tempo"].reshape(-1)   # (B,)
 
         beat_target  = targets["beat"].float()       # (B, T)
         db_target    = targets["downbeat"].float()   # (B, T)
-        tempo_target = targets["tempo"].float().squeeze()  # (B,)
+        tempo_target = targets["tempo"].float().reshape(-1)  # (B,)
 
-        beat_probs = torch.sigmoid(beat_logits)     # (B, T)
-        db_probs   = torch.sigmoid(db_logits)       # (B, T)
-        B, T = beat_probs.shape
+        B, T = beat_logits.shape
+        decoded_tempi = []
 
         for b in range(B):
             # --- Beat decoding ---
-            beat_act = beat_probs[b].detach().cpu().to(torch.float32).numpy()
-            est_beat_times = self.beat_dbn(beat_act)
+            est_beat_times, est_db_times = self.postprocessor(
+                beat_logits[b], db_logits[b]
+            )
             est_beat_mask_np = times_to_mask(est_beat_times, T, self.label_freq)
             est_beat_tensor = torch.from_numpy(est_beat_mask_np).unsqueeze(0)
             ref_beat_tensor = beat_target[b].unsqueeze(0)
             self.test_beat_f1.update(est_beat_tensor, ref_beat_tensor)
 
             # --- Downbeat decoding ---
-            db_act = db_probs[b].detach().cpu().to(torch.float32).numpy()
-            est_db_times = self.dbn_dbn(db_act)
             est_db_mask_np = times_to_mask(est_db_times, T, self.label_freq)
             est_db_tensor = torch.from_numpy(est_db_mask_np).unsqueeze(0)
             ref_db_tensor = db_target[b].unsqueeze(0)
             self.test_db_f1.update(est_db_tensor, ref_db_tensor)
+            decoded_tempi.append(tempo_from_beat_times(est_beat_times))
 
-        # --- Tempo metrics update (B,)
-        self.test_tempo_mae.update(tempo_pred, tempo_target)
-        self.test_tempo_acc.update(tempo_pred, tempo_target)
+        tempo_eval = torch.as_tensor(
+            decoded_tempi, device=tempo_target.device, dtype=tempo_target.dtype
+        )
+        self.test_tempo_mae.update(tempo_eval, tempo_target)
+        self.test_tempo_acc.update(tempo_eval, tempo_target)
 
 
     def on_test_epoch_end(self):
@@ -306,20 +369,19 @@ class BeatDownbeatTempoMultitaskDecoder(nn.Module):
         logits = self.joint_decoder(x)
         # Expect shape [B, T, 3]
         assert logits.dim() == 3 and logits.shape[2] == 3, \
-            f"Expected [B, T, 2], got {logits.shape}"
+            f"Expected [B, T, 3], got {logits.shape}"
         beat_logits = logits[:, :, 0]   # shape: (B, T)
         db_logits   = logits[:, :, 1]   # shape: (B, T)
-        tempo_logits = logits[:, :, 2]  # shape: (B, T)
-
-        # 2) Decode tempo prediction
+        # 2) Decode tempo from the trained beat activation. The historical
+        # third output has no direct gradient whenever the shipped recipe's
+        # tempo loss weight is zero.
         if self.use_ssl_for_tempo:
             # If using SSL embedding for tempo, pool over (L, T) → (B, H)
             ssl_emb = reduce(x, 'b l t h -> b h', 'mean')
             assert ssl_emb.dim() == 2, f"Expected 2D SSL embedding [B, H], got {ssl_emb.shape}"
-            tempo_pred = self.tempo_decoder(tempo_logits, ssl_emb)
+            tempo_pred = self.tempo_decoder(beat_logits, ssl_emb)
         else:
-            # Otherwise, only use tempo_logits (flattened or pooled inside tempo decoder)
-            tempo_pred = self.tempo_decoder(tempo_logits)
+            tempo_pred = self.tempo_decoder(beat_logits)
 
         assert tempo_pred.dim() == 1, f"Expected 1D tensor [B], got {tempo_pred.dim()}D tensor"
 

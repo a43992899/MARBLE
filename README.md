@@ -85,6 +85,35 @@ Marble is a modular, configuration-driven suite for training, evaluating, and pe
 6. **Inference**: We provide scripts for inference on pretrained models. See the [Inference SOTA SSL MIR models](#inference-sota-ssl-mir-models) section below.
 
 
+### BestRQ checkpoint probes
+
+`scripts/run_bestrq_probe.py` evaluates frozen music-tokenizer BestRQ checkpoints on
+GTZAN genre/beat, GS, EMO, or Chords1217. Every probe reduces all 24 hidden layers with
+`MLPReduce(24, 1024)`; beat embeddings are interpolated to 100 Hz. Cached-front-end
+checkpoints support three explicit guards:
+
+- `--frontend-mode online`: decode waveform and compute the recipe's nnAudio 48 kHz/50 Hz Mel online;
+- `--frontend-mode psnr`: compute Mel online, then apply the schema-4 -60 dB clip plus Mel PSNR40 SZ3 round-trip before the recipe's PSNR CMVN;
+- `--frontend-mode sz`: never load waveform; read schema-pinned Mel `.sz` through `SpectrogramCacheDataset`.
+
+```bash
+python scripts/run_bestrq_probe.py --task GTZANGenre --lineage exp2.1 \
+  --checkpoint /path/to/epoch-step=010000.ckpt \
+  --recipe /path/to/mert2/recipes/bestrq/exp2.1_cached_mel16.yaml \
+  --source-root /path/to/mert2 --output-root /path/to/results \
+  --frontend-mode sz --spectrogram-root /path/to/marble/sz-v2 \
+  --expected-contract-sha256 <sha256> \
+  --spectrogram-contract-source-root /path/recorded/in/cache/contract \
+  --probe-seed 1234
+```
+
+SZ mode rejects waveform transforms, validates the full immutable cache-contract SHA,
+and separately validates the contract's recorded source root. The explicit
+`--spectrogram-contract-source-root` permits a frozen MARBLE snapshot to resolve
+the same relative dataset rows without pretending that its path is the cache's
+original generation root. Use distinct output roots for frontend mode and probe
+seed; an existing changed resolved config is never overwritten.
+
 
 ## Supported/In-coming Tasks and Encoders
 

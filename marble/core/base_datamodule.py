@@ -14,6 +14,7 @@ import lightning.pytorch as pl
 
 from marble.core.utils import instantiate_from_config
 from marble.modules.transforms import AudioTransformDataset
+from marble.modules.spectrogram_cache import SpectrogramCacheDataset
 
 
 class BaseDataModule(pl.LightningDataModule, metaclass=ABCMeta):
@@ -25,6 +26,7 @@ class BaseDataModule(pl.LightningDataModule, metaclass=ABCMeta):
         val: dict,
         test: dict,
         audio_transforms: dict | None = None,  # 改成 dict
+        spectrogram_cache: dict | None = None,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -32,6 +34,7 @@ class BaseDataModule(pl.LightningDataModule, metaclass=ABCMeta):
 
         # audio_transforms 是 dict，包含 train/val/test keys
         self.audio_transforms = audio_transforms or {"train": [], "val": [], "test": []}
+        self.spectrogram_cache = dict(spectrogram_cache or {})
 
         self.train_config = train
         self.val_config   = val
@@ -43,6 +46,12 @@ class BaseDataModule(pl.LightningDataModule, metaclass=ABCMeta):
             instantiate_from_config(cfg) 
             for cfg in self.audio_transforms.get(stage, [])
         ]
+        if self.spectrogram_cache:
+            if transforms:
+                raise ValueError(
+                    "Waveform audio_transforms are incompatible with spectrogram_cache"
+                )
+            dataset = SpectrogramCacheDataset(dataset, **self.spectrogram_cache)
         if transforms:
             return AudioTransformDataset(dataset, transforms)
         print(f"No transforms for stage '{stage}', using original dataset.")
@@ -65,7 +74,7 @@ class BaseDataModule(pl.LightningDataModule, metaclass=ABCMeta):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
-            prefetch_factor=2,
+            prefetch_factor=2 if self.num_workers > 0 else None,
         )
 
     def val_dataloader(self):
@@ -75,7 +84,7 @@ class BaseDataModule(pl.LightningDataModule, metaclass=ABCMeta):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
-            prefetch_factor=2,
+            prefetch_factor=2 if self.num_workers > 0 else None,
         )
 
     def test_dataloader(self):
@@ -85,7 +94,7 @@ class BaseDataModule(pl.LightningDataModule, metaclass=ABCMeta):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
-            prefetch_factor=2,
+            prefetch_factor=2 if self.num_workers > 0 else None,
         )
 
 
